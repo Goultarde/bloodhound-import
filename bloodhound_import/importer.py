@@ -8,6 +8,7 @@ from tempfile import NamedTemporaryFile
 from zipfile import ZipFile
 from os.path import basename
 import codecs
+import json
 import ijson
 import logging
 import neo4j
@@ -347,6 +348,22 @@ async def parse_container(tx: neo4j.Transaction, container: dict):
             await tx.run(query, props=dict(source=identifier, target=target['ObjectIdentifier']))
 
 
+async def parse_generic(tx: neo4j.Transaction, obj: dict, objecttype: str):
+    """Keep newer BloodHound object types instead of silently dropping them."""
+    identifier = obj.get('ObjectIdentifier') or obj.get('Properties', {}).get('ObjectIdentifier')
+    if not identifier:
+        logging.warning("Skipping %s object without ObjectIdentifier", objecttype)
+        return
+    properties = obj.get('Properties') or {}
+    query = (
+        'MERGE (n:Base {objectid: $objectid}) '
+        'SET n:BloodHoundObject, n.objecttype = $objecttype, '
+        'n.properties_json = $properties_json'
+    )
+    await tx.run(query, objectid=identifier, objecttype=objecttype,
+                 properties_json=json.dumps(properties, default=str))
+
+
 async def parse_zipfile(filename: str, driver: neo4j.Driver):
     """Parse a bloodhound zip file.
 
@@ -396,12 +413,10 @@ async def parse_file(filename: str, driver: neo4j.AsyncDriver):
         'ous': parse_ou
     }
 
-    parse_function = None
-    try:
-        parse_function = parsing_map[obj_type]
-    except KeyError:
-        logging.error("Parsing function for object type: %s was not found.", obj_type)
-        return
+    parse_function = parsing_map.get(obj_type)
+    if parse_function is None:
+        logging.warning("Using generic parser for unsupported object type: %s", obj_type)
+        parse_function = lambda tx, entry: parse_generic(tx, entry, obj_type)
 
     ten_percent = total // 10 if total > 10 else 1
     count = 0
