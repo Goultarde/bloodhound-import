@@ -1,436 +1,345 @@
-"""
-    Bloodhound importer in python.
-    Queries are borrowed from the BloodhoundAD project.
-"""
+"""Stream BloodHound AD files into Neo4j using CE node and relationship kinds."""
 
-from dataclasses import dataclass
-from tempfile import NamedTemporaryFile
-from zipfile import ZipFile
-from os.path import basename
-import codecs
-import json
-import ijson
+from collections import defaultdict
 import logging
-import neo4j
+from pathlib import Path
+from zipfile import ZipFile
+
+import ijson
 
 
-@dataclass
-class Query:
-    query: str
-    properties: dict
+NODE_TYPES = {
+    "computers": "Computer", "containers": "Container", "users": "User",
+    "groups": "Group", "domains": "Domain", "gpos": "GPO", "ous": "OU",
+    "aiacas": "AIACA", "rootcas": "RootCA", "enterprisecas": "EnterpriseCA",
+    "ntauthstores": "NTAuthStore", "certtemplates": "CertTemplate",
+    "issuancepolicies": "IssuancePolicy", "sites": "Site",
+    "siteservers": "SiteServer", "sitesubnets": "SiteSubnet",
+}
+NODE_KINDS = {kind.lower(): kind for kind in (
+    *NODE_TYPES.values(), "Base", "ADLocalGroup", "ADLocalUser",
+)}
+ACL_KINDS = {kind.lower(): kind for kind in """
+    AllExtendedRights ForceChangePassword AddMember AddAllowedToAct GenericAll
+    WriteDacl GenericWrite AddSelf ReadLAPSPassword ReadGMSAPassword WriteSPN
+    AddKeyCredentialLink GetChanges GetChangesAll GetChangesInFilteredSet
+    WriteAccountRestrictions WriteGPLink SyncLAPSPassword DCSync ManageCertificates
+    ManageCA Enroll WritePKIEnrollmentFlag WritePKINameFlag WriteAltSecurityIdentities
+    WritePublicInformation OwnsLimitedRights WriteOwnerLimitedRights OwnsRaw WriteOwnerRaw
+""".split()}
+ACL_KINDS.update(owns="OwnsRaw", writeowner="WriteOwnerRaw")
+LOCAL_GROUPS = {"LocalAdmins": "544", "RemoteDesktopUsers": "555",
+                "DcomUsers": "562", "PSRemoteUsers": "580"}
+BATCH_SIZE = 500
 
 
-SYNC_COUNT = 100
+async def add_constraints(tx):
+    await tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Base) REQUIRE n.objectid IS UNIQUE")
 
 
-def build_add_edge_query(source_label: str, target_label: str, edge_type: str, edge_props: str) -> str:
-    """Build a standard edge insert query based on the given params"""
-    insert_query = 'UNWIND $props AS prop MERGE (n:Base {{objectid: prop.source}}) SET n:{0} MERGE (m:Base {{objectid: prop.target}}) SET m:{1} MERGE (n)-[r:{2} {3}]->(m)'
-    return insert_query.format(source_label, target_label, edge_type, edge_props)
+def principal(obj):
+    kind = NODE_KINDS.get((obj.get("ObjectType") or "").lower(), "Base")
+    return kind, obj.get("ObjectIdentifier")
 
 
-async def process_ace_list(ace_list: list, objectid: str, objecttype: str, tx: neo4j.Transaction) -> None:
-    for entry in ace_list:
-        principal = entry['PrincipalSID']
-        principaltype = entry['PrincipalType']
-        right = entry['RightName']
+class Batch:
+    def __init__(self):
+        self.rows = defaultdict(list)
 
-        if objectid == principal:
-            continue
-
-        query = build_add_edge_query(principaltype, objecttype, right, '{isacl: true, isinherited: prop.isinherited}')
-        props = dict(
-            source=principal,
-            target=objectid,
-            isinherited=entry['IsInherited'],
+    def node(self, endpoint, properties, collected=False):
+        kind, identifier = endpoint
+        if not identifier:
+            raise ValueError(f"missing ObjectIdentifier for {kind}")
+        props = {key: value for key, value in properties.items()
+                 if key not in ("objectid", "lastseen", "lastcollected", "reconcile")}
+        for key in ("name", "distinguishedname", "operatingsystem"):
+            if isinstance(props.get(key), str):
+                props[key] = props[key].upper()
+        timestamp = "SET n.lastcollected = datetime() " if collected else ""
+        query = (
+            f"UNWIND $rows AS row MERGE (n:Base {{objectid: row.id}}) "
+            f"SET n:{kind}, n.lastseen = datetime() SET n += row.props {timestamp}"
         )
-        await tx.run(query, props=props)
+        self.rows[query].append(dict(id=identifier.upper(), props=props))
 
-
-async def process_spntarget_list(spntarget_list: list, objectid: str, tx: neo4j.Transaction) -> None:
-    for entry in spntarget_list:
-        query = build_add_edge_query('User', 'Computer', 'WriteSPN', '{isacl: false, port: prop.port}')
-        props = dict(
-            source=objectid,
-            target=entry['ComputerSID'],
-            port=entry['Port'], 
+    def edge(self, source, target, kind, **properties):
+        source_kind, source_id = source
+        target_kind, target_id = target
+        if not source_id or not target_id:
+            return
+        query = (
+            f"UNWIND $rows AS row MERGE (a:Base {{objectid: row.source}}) "
+            f"SET a:{source_kind}, a.lastseen = datetime() "
+            f"MERGE (b:Base {{objectid: row.target}}) "
+            f"SET b:{target_kind}, b.lastseen = datetime() "
+            f"MERGE (a)-[r:{kind}]->(b) SET r += row.props SET r.lastseen = datetime()"
         )
-        await tx.run(query, props=props)
+        self.rows[query].append(dict(source=source_id.upper(), target=target_id.upper(),
+                                     props={"isacl": False, **properties}))
+
+    async def write(self, tx):
+        for query, rows in self.rows.items():
+            await (await tx.run(query, rows=rows)).consume()
 
 
-async def add_constraints(tx: neo4j.Transaction):
-    """Adds bloodhound contraints to neo4j
-
-    Arguments:
-        tx {neo4j.Transaction} -- Neo4j transaction.
-    """
-    await tx.run('CREATE CONSTRAINT base_objectid_unique ON (b:Base) ASSERT b.objectid IS UNIQUE')
-    await tx.run('CREATE CONSTRAINT computer_objectid_unique ON (c:Computer) ASSERT c.objectid IS UNIQUE')
-    await tx.run('CREATE CONSTRAINT domain_objectid_unique ON (d:Domain) ASSERT d.objectid IS UNIQUE')
-    await tx.run('CREATE CONSTRAINT group_objectid_unique ON (g:Group) ASSERT g.objectid IS UNIQUE')
-    await tx.run('CREATE CONSTRAINT user_objectid_unique ON (u:User) ASSERT u.objectid IS UNIQUE')
-    await tx.run("CREATE CONSTRAINT ON (c:User) ASSERT c.name IS UNIQUE")
-    await tx.run("CREATE CONSTRAINT ON (c:Computer) ASSERT c.name IS UNIQUE")
-    await tx.run("CREATE CONSTRAINT ON (c:Group) ASSERT c.name IS UNIQUE")
-    await tx.run("CREATE CONSTRAINT ON (c:Domain) ASSERT c.name IS UNIQUE")
-    await tx.run("CREATE CONSTRAINT ON (c:OU) ASSERT c.guid IS UNIQUE")
-    await tx.run("CREATE CONSTRAINT ON (c:GPO) ASSERT c.name IS UNIQUE")
+def session_edge(batch, session, fallback=None):
+    props = {"logontype": session["LogonType"]} if "LogonType" in session else {}
+    batch.edge(("Computer", session.get("ComputerSID") or fallback),
+               ("User", session.get("UserSID")), "HasSession", **props)
 
 
-async def parse_ou(tx: neo4j.Transaction, ou: dict):
-    """Parses a single ou.
-
-    Arguments:
-        tx {neo4j.Transaction} -- Neo4j session
-        ou {dict} -- Single ou object.
-    """
-    identifier = ou['ObjectIdentifier'].upper()
-    property_query = 'UNWIND $props AS prop MERGE (n:Base {objectid: prop.source}) SET n:OU SET n += prop.map'
-    props = {'map': ou['Properties'], 'source': identifier}
-    await tx.run(property_query, props=props)
-
-    if 'Aces' in ou and ou['Aces'] is not None:
-        await process_ace_list(ou['Aces'], identifier, "OU", tx)
-
-    if 'ChildObjects' in ou and ou['ChildObjects']:
-        targets = ou['ChildObjects']
-        for target in targets:
-            query = build_add_edge_query('OU', target['ObjectType'], 'Contains', '{isacl: false}')
-            await tx.run(query, props=dict(source=identifier, target=target['ObjectIdentifier']))
-
-    if 'Links' in ou and ou['Links']:
-        query = build_add_edge_query('GPO', 'OU', 'GpLink', '{isacl: false, enforced: prop.enforced}')
-        for gpo in ou['Links']:
-            await tx.run(query, props=dict(source=identifier, target=gpo['GUID'].upper(), enforced=gpo['IsEnforced']))
-
-    options = [
-        ('LocalAdmins', 'AdminTo'),
-        ('PSRemoteUsers', 'CanPSRemote'),
-        ('DcomUsers', 'ExecuteDCOM'),
-        ('RemoteDesktopUsers', 'CanRDP'),
-    ]
-
-    if 'GPOChanges' in ou and ou['GPOChanges']:
-        gpo_changes = ou['GPOChanges']
-        affected_computers = gpo_changes['AffectedComputers']
-        for option, edge_name in options:
-            if option in gpo_changes and gpo_changes[option]:
-                targets = gpo_changes[option]
-                for target in targets:
-                    query = build_add_edge_query(target['ObjectType'], 'Computer', edge_name, '{isacl: false, fromgpo: true}')
-                    for computer in affected_computers:
-                        await tx.run(query, props=dict(source=computer['ObjectIdentifier'], target=target['ObjectIdentifier']))
-
-
-async def parse_gpo(tx: neo4j.Transaction, gpo: dict):
-    """Parses a single GPO.
-
-    Arguments:
-        tx {neo4j.Transaction} -- Neo4j transaction
-        gpo {dict} -- Single gpo object.
-    """
-    identifier = gpo['ObjectIdentifier']
-
-    query = 'UNWIND $props AS prop MERGE (n:Base {objectid: prop.source}) SET n:GPO SET n += prop.map'
-    props = {'map': gpo['Properties'], 'source': identifier}
-    await tx.run(query, props=props)
-
-    if "Aces" in gpo and gpo["Aces"] is not None:
-        await process_ace_list(gpo['Aces'], identifier, "GPO", tx)
-
-
-async def parse_computer(tx: neo4j.Transaction, computer: dict):
-    """Parse a computer object.
-
-    Arguments:
-        session {neo4j.Transaction} -- Neo4j transaction
-        computer {dict} -- Single computer object.
-    """
-    identifier = computer['ObjectIdentifier']
-
-    property_query = 'UNWIND $props AS prop MERGE (n:Base {objectid: prop.source}) SET n:Computer SET n += prop.map'
-    props = {'map': computer['Properties'], 'source': identifier}
-
-    await tx.run(property_query, props=props)
-
-    if 'PrimaryGroupSid' in computer and computer['PrimaryGroupSid']:
-        query = build_add_edge_query('Computer', 'Group', 'MemberOf', '{isacl:false}')
-        await tx.run(query, props=dict(source=identifier, target=computer['PrimaryGroupSid']))
-
-    if 'AllowedToDelegate' in computer and computer['AllowedToDelegate']:
-        query = build_add_edge_query('Computer', 'Group', 'MemberOf', '{isacl:false}')
-        for entry in computer['AllowedToDelegate']:
-            await tx.run(query, props=dict(source=identifier, target=entry['ObjectIdentifier']))
-
-    # (Property name, Edge name, Use "Results" format)
-    options = [
-        ('LocalAdmins', 'AdminTo', True),
-        ('RemoteDesktopUsers', 'CanRDP', True),
-        ('DcomUsers', 'ExecuteDCOM', True),
-        ('PSRemoteUsers', 'CanPSRemote', True),
-        ('AllowedToAct', 'AllowedToAct', False),
-        ('AllowedToDelegate', 'AllowedToDelegate', False),
-    ]
-
-    for option, edge_name, use_results in options:
-        if option in computer:
-            targets = computer[option]['Results'] if use_results else computer[option]
-            for target in targets:
-                query = build_add_edge_query(target['ObjectType'], 'Computer', edge_name, '{isacl:false, fromgpo: false}')
-                await tx.run(query, props=dict(source=target['ObjectIdentifier'], target=identifier))
-
-    # (Session type, source)
-    session_types = [
-        ('Sessions', 'netsessionenum'),
-        ('PrivilegedSessions', 'netwkstauserenum'),
-        ('RegistrySessions', 'registry'),
-    ]
-
-    for session_type, source in session_types:
-        if session_type in computer and computer[session_type]['Results']:
-            query = build_add_edge_query('Computer', 'User', 'HasSession', '{isacl:false, source:"%s"}' % source)
-            for entry in computer[session_type]['Results']:
-                await tx.run(query, props=dict(target=entry['UserSID'], source=identifier))
-
-    if 'Aces' in computer and computer['Aces'] is not None:
-        await process_ace_list(computer['Aces'], identifier, "Computer", tx)
-
-
-async def parse_user(tx: neo4j.Transaction, user: dict):
-    """Parse a user object.
-
-    Arguments:
-        tx {neo4j.Transaction} -- Neo4j session
-        user {dict} -- Single user object from the bloodhound json.
-    """
-    identifier = user['ObjectIdentifier']
-    property_query = 'UNWIND $props AS prop MERGE (n:Base {objectid: prop.source}) SET n:User SET n += prop.map'
-    props = {'map': user['Properties'], 'source': identifier}
-
-    await tx.run(property_query, props=props)
-
-    if 'PrimaryGroupSid' in user and user['PrimaryGroupSid']:
-        query = build_add_edge_query('User', 'Group', 'MemberOf', '{isacl: false}')
-        await tx.run(query, props=dict(source=identifier, target=user['PrimaryGroupSid']))
-
-    if 'AllowedToDelegate' in user and user['AllowedToDelegate']:
-        query = build_add_edge_query('User', 'Computer', 'AllowedToDelegate', '{isacl: false}')
-        for entry in user['AllowedToDelegate']:
-            await tx.run(query, props=dict(source=identifier, target=entry['ObjectIdentifier']))
-
-    # TODO add HasSIDHistory objects
-
-    if 'Aces' in user and user['Aces'] is not None:
-        await process_ace_list(user['Aces'], identifier, "User", tx)
-
-    if 'SPNTargets' in user and user['SPNTargets'] is not None:
-        await process_spntarget_list(user['SPNTargets'], identifier, tx)
-
-
-async def parse_group(tx: neo4j.Transaction, group: dict):
-    """Parse a group object.
-
-    Arguments:
-        tx {neo4j.Transaction} -- Neo4j Transaction
-        group {dict} -- Single group object from the bloodhound json.
-    """
-    properties = group['Properties']
-    identifier = group['ObjectIdentifier']
-    members = group['Members']
-
-    property_query = 'UNWIND $props AS prop MERGE (n:Base {objectid: prop.source}) SET n:Group SET n += prop.map'
-    props = {'map': properties, 'source': identifier}
-    await tx.run(property_query, props=props)
-
-    if 'Aces' in group and group['Aces'] is not None:
-        await process_ace_list(group['Aces'], identifier, "Group", tx)
-
+def local_group(batch, computer, identifier, members, name=None):
+    group = ("ADLocalGroup", identifier)
+    batch.node(group, {"name": name} if name else {})
+    batch.edge(group, computer, "LocalToComputer")
     for member in members:
-        query = build_add_edge_query(member['ObjectType'], 'Group', 'MemberOf', '{isacl: false}')
-        await tx.run(query, props=dict(source=member['ObjectIdentifier'], target=identifier))
+        batch.edge(principal(member), group, "MemberOfLocalGroup")
 
 
-async def parse_domain(tx: neo4j.Transaction, domain: dict):
-    """Parse a domain object.
-
-    Arguments:
-        tx {neo4j.Transaction} -- Neo4j Transaction
-        domain {dict} -- Single domain object from the bloodhound json.
-    """
-    identifier = domain['ObjectIdentifier']
-    property_query = 'UNWIND $props AS prop MERGE (n:Base {objectid: prop.source}) SET n:Domain SET n += prop.map'
-    props = {'map': domain['Properties'], 'source': identifier}
-    await tx.run(property_query, props=props)
-
-    if 'Aces' in domain and domain['Aces'] is not None:
-        await process_ace_list(domain['Aces'], identifier, 'Domain', tx)
-
-    trust_map = {0: 'ParentChild', 1: 'CrossLink', 2: 'Forest', 3: 'External', 4: 'Unknown'}
-    if 'Trusts' in domain and domain['Trusts'] is not None:
-        query = build_add_edge_query('Domain', 'Domain', 'TrustedBy', '{sidfiltering: prop.sidfiltering, trusttype: prop.trusttype, transitive: prop.transitive, isacl: false}')
-        for trust in domain['Trusts']:
-            trust_type = trust['TrustType']
-            direction = trust['TrustDirection']
-            props = {}
-            if direction in [1, 3]:
-                props = dict(
-                    source=identifier,
-                    target=trust['TargetDomainSid'],
-                    trusttype=trust_map[trust_type],
-                    transitive=trust['IsTransitive'],
-                    sidfiltering=trust['SidFilteringEnabled'],
-                )
-            elif direction in [2, 4]:
-                props = dict(
-                    target=identifier,
-                    source=trust['TargetDomainSid'],
-                    trusttype=trust_map[trust_type],
-                    transitive=trust['IsTransitive'],
-                    sidfiltering=trust['SidFilteringEnabled'],
-                )
-            else:
-                logging.error("Could not determine direction of trust... direction: %s", direction)
-                continue
-            await tx.run(query, props=props)
-
-    if 'ChildObjects' in domain and domain['ChildObjects']:
-        targets = domain['ChildObjects']
-        for target in targets:
-            query = build_add_edge_query('Domain', target['ObjectType'], 'Contains', '{isacl: false}')
-            await tx.run(query, props=dict(source=identifier, target=target['ObjectIdentifier']))
-
-    if 'Links' in domain and domain['Links']:
-        query = build_add_edge_query('GPO', 'OU', 'GpLink', '{isacl: false, enforced: prop.enforced}')
-        for gpo in domain['Links']:
-            await tx.run(
-                query,
-                props=dict(source=identifier, target=gpo['GUID'].upper(), enforced=gpo['IsEnforced'])
-            )
-
-    options = [
-        ('LocalAdmins', 'AdminTo'),
-        ('PSRemoteUsers', 'CanPSRemote'),
-        ('DcomUsers', 'ExecuteDCOM'),
-        ('RemoteDesktopUsers', 'CanRDP'),
-    ]
-
-    if 'GPOChanges' in domain and domain['GPOChanges']:
-        gpo_changes = domain['GPOChanges']
-        affected_computers = gpo_changes['AffectedComputers']
-        for option, edge_name in options:
-            if option in gpo_changes and gpo_changes[option]:
-                targets = gpo_changes[option]
-                for target in targets:
-                    query = build_add_edge_query(target['ObjectType'], 'Computer', edge_name, '{isacl: false, fromgpo: true}')
-                    for computer in affected_computers:
-                        await tx.run(query, props=dict(source=computer['ObjectIdentifier'], target=target['ObjectIdentifier']))
-
-async def parse_container(tx: neo4j.Transaction, container: dict):
-    """Parse a Container object.
-
-    Arguments:
-        tx {neo4j.Transaction} -- Neo4j session
-        container {dict} -- Single container object from the bloodhound json.
-    """
-    identifier = container['ObjectIdentifier']
-    property_query = 'UNWIND $props AS prop MERGE (n:Base {objectid: prop.source}) SET n:Container SET n += prop.map'
-    props = {'map': container['Properties'], 'source': identifier}
-
-    await tx.run(property_query, props=props)
-
-    if 'Aces' in container and container['Aces'] is not None:
-        await process_ace_list(container['Aces'], identifier, "Container", tx)
-
-    if 'ChildObjects' in container and container['ChildObjects']:
-        targets = container['ChildObjects']
-        for target in targets:
-            query = build_add_edge_query('Container', target['ObjectType'], 'Contains', '{isacl: false}')
-            await tx.run(query, props=dict(source=identifier, target=target['ObjectIdentifier']))
+def trusts(batch, domain, entries):
+    for trust in entries:
+        direction = trust["TrustDirection"]
+        direction = {0: "Disabled", 1: "Inbound", 2: "Outbound", 3: "Bidirectional"}.get(direction, direction)
+        if direction == "Disabled":
+            continue
+        if direction not in ("Inbound", "Outbound", "Bidirectional"):
+            raise ValueError(f"unknown trust direction {direction!r}")
+        trust_type = trust["TrustType"]
+        trust_type = {0: "ParentChild", 1: "CrossLink", 2: "Forest",
+                      3: "External", 4: "Unknown"}.get(trust_type, trust_type)
+        other = ("Domain", trust["TargetDomainSid"])
+        batch.node(other, {k: v for k, v in {
+            "name": trust.get("TargetDomainName"), "domainsid": other[1].upper(),
+        }.items() if v})
+        kind = "SameForestTrust" if trust_type in ("ParentChild", "TreeRoot", "CrossLink") else "CrossForestTrust"
+        props = dict(trusttype=trust_type, transitive=trust.get("IsTransitive", False))
+        attributes = trust.get("TrustAttributes")
+        if attributes is not None:
+            attributes = int(attributes)
+        if direction in ("Inbound", "Bidirectional"):
+            inbound = dict(trustattributesinbound=attributes)
+            if attributes is not None:
+                inbound["tgtdelegation"] = trust.get("TGTDelegationEnabled", False)
+            batch.edge(other, domain, kind, **props, **inbound)
+            if kind == "CrossForestTrust" and trust.get("TGTDelegationEnabled"):
+                batch.edge(other, domain, "AbuseTGTDelegation", trusttype=trust_type)
+        if direction in ("Outbound", "Bidirectional"):
+            filtering = trust.get("SidFilteringEnabled", False)
+            batch.edge(domain, other, kind, **props, spoofsidhistoryblocked=filtering,
+                       trustattributesoutbound=attributes)
+            if kind == "CrossForestTrust" and not filtering:
+                batch.edge(other, domain, "SpoofSIDHistory", trusttype=trust_type)
 
 
-async def parse_generic(tx: neo4j.Transaction, obj: dict, objecttype: str):
-    """Keep newer BloodHound object types instead of silently dropping them."""
-    identifier = obj.get('ObjectIdentifier') or obj.get('Properties', {}).get('ObjectIdentifier')
-    if not identifier:
-        logging.warning("Skipping %s object without ObjectIdentifier", objecttype)
-        return
-    properties = obj.get('Properties') or {}
-    query = (
-        'MERGE (n:Base {objectid: $objectid}) '
-        'SET n:BloodHoundObject, n.objecttype = $objecttype, '
-        'n.properties_json = $properties_json'
-    )
-    await tx.run(query, objectid=identifier, objecttype=objecttype,
-                 properties_json=json.dumps(properties, default=str))
-
-
-async def parse_zipfile(filename: str, driver: neo4j.Driver):
-    """Parse a bloodhound zip file.
-
-    Arguments:
-        filename {str} -- ZIP filename to parse.
-        driver {neo4j.GraphDatabase} -- driver to connect to neo4j.
-    """
-    with ZipFile(filename) as zip_file:
-       for file in zip_file.namelist():
-            if not file.endswith('.json'):
-                logging.info("File does not appear to be JSON, skipping: %s", file)
-                continue
-
-            with NamedTemporaryFile(suffix=basename(file)) as temp:
-                temp.write(zip_file.read(file))
-                temp.flush()
-                await parse_file(temp.name, driver)
-
-
-async def parse_file(filename: str, driver: neo4j.AsyncDriver):
-    """Parse a bloodhound file.
-
-    Arguments:
-        filename {str} -- JSON filename to parse.
-        driver {neo4j.GraphDatabase} -- driver to connect to neo4j.
-    """
-    logging.info("Parsing bloodhound file: %s", filename)
-
-    if filename.endswith('.zip'):
-        logging.info("File appears to be a zip file, importing all containing JSON files..")
-        await parse_zipfile(filename, driver)
+def convert_object(batch, kind, obj, warnings):
+    if kind == "sessions":
+        session_edge(batch, obj)
         return
 
-    with codecs.open(filename, 'r', encoding='utf-8-sig') as f:
-        meta = ijson.items(f, 'meta')
-        for o in meta:
-            obj_type = o['type']
-            total = o['count']
+    identifier = obj.get("ObjectIdentifier")
+    if not isinstance(identifier, str) or not identifier.strip():
+        warnings.add(f"skipped {kind} records without an ObjectIdentifier")
+        return
+    current = (kind, identifier)
+    props = dict(obj.get("Properties") or {})
+    for field in ("IsDeleted", "IsACLProtected", "InheritanceHashes"):
+        if field in obj:
+            props[field.lower()] = obj[field]
+    domain_sid = obj.get("DomainSID") or props.get("domainsid")
+    if domain_sid:
+        props["domainsid"] = domain_sid.upper()
 
-    parsing_map = {
-        'computers': parse_computer,
-        'containers': parse_container,
-        'users': parse_user,
-        'groups': parse_group,
-        'domains': parse_domain,
-        'gpos': parse_gpo,
-        'ous': parse_ou
-    }
+    aces = obj.get("Aces") or []
+    registry = obj.get("CARegistryData") or {}
+    ca_security = registry.get("CASecurity") or {}
+    if kind == "EnterpriseCA" and ca_security.get("Collected"):
+        registry_rights = {"manageca", "managecertificates", "enroll"}
+        aces = [
+            ace for ace in aces
+            if ace.get("PrincipalSID") == obj.get("HostingComputer")
+            or ace["RightName"].lower() not in registry_rights
+        ] + [
+            ace for ace in ca_security.get("Data") or []
+            if (ace.get("PrincipalType") or "").lower() not in ("adlocalgroup", "localgroup")
+            and ace["RightName"].lower() != "owns"
+        ]
+    owner_rights = any((ace.get("PrincipalSID") or "").endswith("S-1-3-4") for ace in aces)
+    for ace in aces:
+        sid = ace.get("PrincipalSID")
+        if not sid or sid.upper() == identifier.upper() or sid.endswith("S-1-3-4"):
+            continue
+        right = ACL_KINDS.get(ace["RightName"].lower())
+        if not right:
+            warnings.add(f"unsupported ACE kind {ace['RightName']!r}")
+            continue
+        if right == "OwnsRaw":
+            props["ownersid"] = sid.upper()
+        # shortcut: OWNER RIGHTS limits need CE's full ACL converter to emit limited rights.
+        if owner_rights and right in ("OwnsRaw", "WriteOwnerRaw"):
+            warnings.add("ownership edges with OWNER RIGHTS restrictions require native CE import")
+            continue
+        source_kind = NODE_KINDS.get((ace.get("PrincipalType") or "").lower(), "Base")
+        batch.edge((source_kind, sid), current, right, isacl=True,
+                   isinherited=ace.get("IsInherited", False), inheritancehash=ace.get("InheritanceHash", ""))
 
-    parse_function = parsing_map.get(obj_type)
-    if parse_function is None:
-        logging.warning("Using generic parser for unsupported object type: %s", obj_type)
-        parse_function = lambda tx, entry: parse_generic(tx, entry, obj_type)
+    container = obj.get("ContainedBy")
+    if container:
+        batch.edge(principal(container), current, "Contains")
+    for child in obj.get("ChildObjects") or []:
+        batch.edge(current, principal(child), "Contains")
+    if kind in ("Domain", "OU", "Site"):
+        for link in obj.get("Links") or []:
+            batch.edge(("GPO", link["GUID"]), current, "GPLink", enforced=link.get("IsEnforced", False))
 
-    ten_percent = total // 10 if total > 10 else 1
+    primary = obj.get("PrimaryGroupSID") or obj.get("PrimaryGroupSid")
+    if primary:
+        batch.edge(current, ("Group", primary), "MemberOf", isprimarygroup=True)
+    for member in obj.get("Members") or []:
+        member_endpoint = principal(member)
+        if (member_endpoint[1] or "").upper().startswith("DN="):
+            warnings.add("group members referenced by distinguished name require native CE import")
+        else:
+            batch.edge(member_endpoint, current, "MemberOf", isprimarygroup=False)
+    for field in ("AllowedToDelegate", "HasSIDHistory", "DumpSMSAPassword"):
+        for target in obj.get(field) or []:
+            batch.edge(current, principal(target), field)
+    for actor in obj.get("AllowedToAct") or []:
+        batch.edge(principal(actor), current, "AllowedToAct")
+    for spn in obj.get("SPNTargets") or obj.get("SpnTargets") or []:
+        if spn.get("Service", "").lower() == "sqladmin":
+            batch.edge(current, ("Computer", spn.get("ComputerSID")), "SQLAdmin",
+                       isacl=True, port=spn.get("Port"))
+        else:
+            warnings.add(f"unsupported SPN service {spn.get('Service')!r}")
+
+    if kind == "Computer":
+        for field in ("Sessions", "PrivilegedSessions", "RegistrySessions"):
+            result = obj.get(field) or {}
+            if result.get("Collected", True):
+                for session in result.get("Results") or []:
+                    session_edge(batch, session, identifier)
+        for group in obj.get("LocalGroups") or []:
+            members = group.get("Results") or []
+            name = group.get("Name") or ""
+            if group.get("Collected") and (members or name.upper().startswith("DIRECT ACCESS USERS")):
+                local_group(batch, current, group["ObjectIdentifier"], members, name)
+                for local in group.get("LocalNames") or []:
+                    batch.node(("Base", local["ObjectIdentifier"]), {"name": local["PrincipalName"]})
+        for field, rid in LOCAL_GROUPS.items():
+            result = obj.get(field) or {}
+            if result.get("Collected", True) and result.get("Results"):
+                local_group(batch, current, f"{identifier}-{rid}", result["Results"])
+        for right in obj.get("UserRights") or []:
+            if right.get("Collected") and right.get("Privilege") == "SeRemoteInteractiveLogonRight":
+                for member in right.get("Results") or []:
+                    props["hasura"] = True
+                    batch.edge(principal(member), current, "RemoteInteractiveLogonRight")
+        if obj.get("IsDC") and domain_sid:
+            batch.edge(current, ("Domain", domain_sid), "DCFor")
+
+    if kind in ("Computer", "User") and domain_sid and not obj.get("IsDC"):
+        if props.get("unconstraineddelegation", obj.get("UnconstrainedDelegation")):
+            batch.edge(current, ("Domain", domain_sid), "CoerceToTGT")
+    changes = obj.get("GPOChanges") or {}
+    for computer in changes.get("AffectedComputers") or []:
+        for field, rid in LOCAL_GROUPS.items():
+            if changes.get(field):
+                computer_id = computer["ObjectIdentifier"]
+                local_group(batch, ("Computer", computer_id), f"{computer_id}-{rid}", changes[field])
+    if kind == "Domain":
+        trusts(batch, current, obj.get("Trusts") or [])
+
+    if domain_sid and kind in ("RootCA", "NTAuthStore"):
+        batch.edge(current, ("Domain", domain_sid), f"{kind}For")
+    if kind == "EnterpriseCA":
+        templates = obj.get("EnabledCertTemplates") or []
+        for template in templates:
+            batch.edge(("CertTemplate", template.get("ObjectIdentifier")), current, "PublishedTo")
+        batch.edge(("Computer", obj.get("HostingComputer")), current, "HostsCAService")
+        for field, key in {
+            "IsUserSpecifiesSanEnabled": "isuserspecifiessanenabled",
+            "RoleSeparationEnabled": "roleseparationenabled",
+            "RPCEncryptionEnforced": "rpcencryptionenforced",
+            "DisabledExtensions": "disabledextensions",
+        }.items():
+            result = registry.get(field) or {}
+            if result.get("Collected"):
+                props[key] = result.get("Data" if field == "DisabledExtensions" else "Value")
+        enrollment = registry.get("EnrollmentAgentRestrictions") or {}
+        if enrollment.get("Collected"):
+            restrictions = enrollment.get("Restrictions") or []
+            props["hasenrollmentagentrestrictions"] = bool(restrictions)
+            for restriction in restrictions:
+                if restriction.get("AccessType") == "AccessAllowedCallback":
+                    targets = templates if restriction.get("AllTemplates") else [restriction["Template"]]
+                    for target in targets:
+                        batch.edge(principal(restriction["Agent"]),
+                                   ("CertTemplate", target.get("ObjectIdentifier")),
+                                   "DelegatedEnrollmentAgent")
+    if kind == "IssuancePolicy" and obj.get("GroupLink"):
+        target = principal(obj["GroupLink"])
+        if target[1]:
+            props["grouplinkid"] = target[1].upper()
+            batch.edge(current, target, "OIDGroupLink")
+    if kind == "SiteServer" and obj.get("ServerIs"):
+        batch.edge(current, principal(obj["ServerIs"]), "ServerIs")
+    if any(isinstance(item, dict) and item.get("Collected")
+           for item in (obj.get("DCRegistryData") or {}).values()):
+        warnings.add("collected DCRegistryData requires native CE import")
+    batch.node(current, props, collected=True)
+
+
+async def parse_json(file, name, session):
+    # ijson requires raw UTF-8 without the optional BOM emitted by some collectors.
+    if file.read(3) != b"\xef\xbb\xbf":
+        file.seek(0)
+    start = file.tell()
+    meta = next(ijson.items(file, "meta", use_float=True), None)
+    data_type = meta.get("type") if isinstance(meta, dict) else None
+    kind = "sessions" if data_type == "sessions" else NODE_TYPES.get(data_type)
+    if not kind:
+        raise ValueError(f"unsupported direct import type {data_type!r} in {name}")
+
+    file.seek(start)
+    events = ijson.parse(file, use_float=True)
+    for prefix, event, _ in events:
+        if prefix == "data":
+            if event != "start_array":
+                raise ValueError(f"expected a data array in {name}")
+            break
+    else:
+        raise ValueError(f"missing data array in {name}")
+
+    batch = Batch()
+    warnings = set()
     count = 0
-    f = codecs.open(filename, 'r', encoding='utf-8-sig')
-    objs = ijson.items(f, 'data.item')
-    async with driver.session() as session:
-        for entry in objs:
-            try:
-                await session.write_transaction(parse_function, entry)
-                count = count + 1
-            except neo4j.exceptions.ConstraintError as e:
-                print(e)
-            if count % ten_percent == 0:
-                logging.info("Parsed %d out of %d records in %s.", count, total, filename)
+    for obj in ijson.items(events, "data.item"):
+        convert_object(batch, kind, obj, warnings)
+        count += 1
+        if count % BATCH_SIZE == 0:
+            await session.execute_write(batch.write)
+            batch = Batch()
+    if batch.rows:
+        await session.execute_write(batch.write)
+    for warning in sorted(warnings):
+        logging.warning("%s: %s", name, warning)
+    logging.info("Processed %d %s records from %s", count, data_type, name)
 
-    f.close()
-    logging.info("Completed file: %s", filename)
+
+async def parse_file(filename, driver):
+    path = Path(filename)
+    async with driver.session() as session:
+        if path.suffix.lower() == ".zip":
+            with ZipFile(path) as archive:
+                members = [member for member in archive.infolist()
+                           if not member.is_dir() and member.filename.lower().endswith(".json")]
+                if not members:
+                    raise ValueError(f"no JSON files in {path}")
+                for member in members:
+                    with archive.open(member) as file:
+                        await parse_json(file, f"{path}:{member.filename}", session)
+        elif path.suffix.lower() == ".json":
+            with path.open("rb") as file:
+                await parse_json(file, str(path), session)
+        else:
+            raise ValueError(f"expected a ZIP or JSON file: {path}")

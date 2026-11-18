@@ -8,13 +8,14 @@ setup(
     classifiers=[
         'Intended Audience :: Information Technology',
         'License :: OSI Approved :: MIT License',
-        'Programming Language :: Python :: 3.7',
+        'Programming Language :: Python :: 3.8',
     ],
     author='Matthijs Gielen / Fox-IT',
     author_email='matthijs.gielen@fox-it.com',
     url='https://github.com/fox-it/bloodhound-import',
     packages=['bloodhound_import'],
-    install_requires=['neo4j-driver', 'ijson'],
+    python_requires='>=3.8',
+    install_requires=['neo4j>=5', 'ijson'],
     entry_points={
         'console_scripts': ['bloodhound-import=bloodhound_import.__main__:cli']
     }
